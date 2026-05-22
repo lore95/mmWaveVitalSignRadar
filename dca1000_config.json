@@ -1,0 +1,149 @@
+{
+    "_description": "DCA1000EVM Configuration - Extracted from working mmWave Studio session (May 8, 2026)",
+    "_source_log": {
+        "eth_init": "ar1.CaptureCardConfig_EthInit('192.168.33.30', '192.168.33.180', '12:34:56:78:90:12', 4096, 4098)",
+        "mode": "ar1.CaptureCardConfig_Mode(1, 2, 1, 2, 3, 30)",
+        "packet_delay": "ar1.CaptureCardConfig_PacketDelay(25)",
+        "fpga_version": "FPGA Version : 2.9 [Record]"
+    },
+
+    "network": {
+        "dca1000_ip": "192.168.33.180",
+        "host_ip": "192.168.33.30",
+        "dca1000_mac": "12:34:56:78:90:12",
+        "cmd_port": 4096,
+        "cmd_port_description": "UDP port for sending commands to DCA1000",
+        "data_port": 4098,
+        "data_port_description": "UDP port where DCA1000 streams raw ADC data"
+    },
+
+    "fpga_config": {
+        "packet_logging_mode": 1,
+        "packet_logging_mode_description": "1=Raw, 2=Multi",
+        "lvds_mode": 2,
+        "lvds_mode_description": "1=4lane, 2=2lane",
+        "data_transfer_mode": 1,
+        "data_transfer_mode_description": "1=LVDS capture, 2=playback",
+        "data_capture_mode": 2,
+        "data_capture_mode_description": "1=SD card, 2=Ethernet stream",
+        "data_format_mode": 3,
+        "data_format_mode_description": "3=16-bit",
+        "timer_val": 30,
+        "timer_val_description": "Timeout in seconds"
+    },
+
+    "packet_delay_us": 25,
+    "packet_delay_description": "Delay between UDP packets in microseconds",
+
+    "dca1000_switch_settings": {
+        "SW2.1_SW_CONFIG": "ON",
+        "SW2.2_DATA_MODE": "OFF",
+        "SW2.3_AR1642_MODE": "OFF (1243 mode for AWR1843)",
+        "SW2.4_ETH_STREAM": "ON",
+        "SW2.5_DMM_PLAYBACK": "OFF (RAW mode)",
+        "SW2.6_HW_CONFIG": "OFF",
+        "SW2.7_USER_SW2": "OFF",
+        "SW2.8_USER_SW3": "OFF"
+    },
+
+    "udp_command_protocol": {
+        "_description": "DCA1000 UDP command packet format",
+        "header": "0xA55A",
+        "footer": "0xEEAA",
+        "packet_structure": "[header:2bytes][cmd_code:2bytes][data_length:2bytes][data:variable][footer:2bytes]",
+        
+        "commands": {
+            "RESET_FPGA": {
+                "code": "0x0100",
+                "data": "none",
+                "description": "Reset the FPGA"
+            },
+            "RESET_AR_DEV": {
+                "code": "0x0200",
+                "data": "none",
+                "description": "Reset the connected radar device"
+            },
+            "CONFIG_FPGA_GEN": {
+                "code": "0x0300",
+                "data": "6 bytes - logging_mode(2) + lvds_mode(2) + data_transfer_mode(2) + data_capture_mode(2) + data_format_mode(2) + timer(2)",
+                "description": "Configure FPGA general settings",
+                "working_data_hex": "01000200010002000300 1E00",
+                "working_data_description": "raw=1, lvds_2lane=2, capture=1, ethernet=2, 16bit=3, timer=30"
+            },
+            "CONFIG_PACKET_DATA": {
+                "code": "0x0B00",
+                "data": "2 bytes - packet_delay in us (little-endian)",
+                "description": "Configure delay between data packets",
+                "working_data_hex": "1900",
+                "working_data_description": "25 us delay"
+            },
+            "START_RECORD": {
+                "code": "0x0500",
+                "data": "none",
+                "description": "Arm DCA1000 to start recording (send BEFORE triggering radar frames)"
+            },
+            "STOP_RECORD": {
+                "code": "0x0600",
+                "data": "none",
+                "description": "Stop recording"
+            },
+            "SYSTEM_CONNECT": {
+                "code": "0x0900",
+                "data": "none",
+                "description": "Check if DCA1000 is connected and responsive"
+            },
+            "READ_FPGA_VERSION": {
+                "code": "0x0E00",
+                "data": "none",
+                "description": "Read FPGA firmware version"
+            }
+        },
+
+        "response_format": {
+            "header": "0xA55A",
+            "footer": "0xEEAA",
+            "structure": "[header:2bytes][cmd_code:2bytes][status:2bytes][footer:2bytes]",
+            "status_codes": {
+                "0x0000": "Success",
+                "0x0001": "Failure"
+            }
+        }
+    },
+
+    "raw_data_packet_format": {
+        "_description": "Format of UDP packets received on data port (4098)",
+        "header_size_bytes": 10,
+        "header_fields": {
+            "sequence_number": "4 bytes (little-endian uint32)",
+            "byte_count": "6 bytes (little-endian uint48, total bytes transferred)"
+        },
+        "payload": "Raw ADC samples, 16-bit signed integers, I/Q interleaved",
+        "max_packet_size_bytes": 1472,
+        "payload_per_packet_bytes": 1462,
+        "sample_format": {
+            "bits_per_sample": 16,
+            "type": "signed int16 (little-endian)",
+            "interleaving": "I, Q, I, Q, ... for each RX channel",
+            "channel_interleaving": "All samples for RX0, then RX1, etc. within each chirp"
+        }
+    },
+
+    "radar_parameters_for_parsing": {
+        "num_adc_samples_per_chirp": 256,
+        "num_chirps_per_frame": 128,
+        "num_rx_channels": 1,
+        "num_tx_channels": 1,
+        "adc_bits": 16,
+        "adc_format": "complex (I+Q)",
+        "bytes_per_sample": 4,
+        "bytes_per_chirp": 1024,
+        "bytes_per_frame": 131072,
+        "frame_periodicity_ms": 40,
+        "start_freq_ghz": 77,
+        "slope_mhz_per_us": 29.982,
+        "sample_rate_ksps": 10000,
+        "bandwidth_mhz": 1798.92,
+        "range_resolution_m": 0.083,
+        "max_range_m": 10.67
+    }
+}
