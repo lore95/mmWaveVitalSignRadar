@@ -88,13 +88,6 @@ class KalmanPeakTracker:
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
 
-        # Cap position uncertainty growth — after many missed frames the
-        # variance can explode and cause the gate to accept spurious peaks
-        # anywhere. Cap at 10-bin sigma (~75 cm).
-        max_pos_var = 100.0   # sigma^2 = 100 → sigma = 10 bins
-        if self.P[0, 0] > max_pos_var:
-            self.P[0, 0] = max_pos_var
-
         # Clamp position to valid range
         self.x[0] = np.clip(self.x[0], self.min_bin, self.max_bin)
 

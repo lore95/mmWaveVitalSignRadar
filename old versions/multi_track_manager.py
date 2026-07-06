@@ -36,25 +36,7 @@ TRACK_COLORS = [
     "#55efc4",   # mint
 ]
 
-BP_LO, BP_HI = 0.04, 0.6    # 2.4 – 36 BPM (covers down to ~3 BPM)
-
-# Breathing validation
-VALIDATION_TIER1_S  = 10.0   # first check at 10 seconds
-VALIDATION_TIER2_S  = 25.0   # extended check for very slow breathing (<6 BPM)
-VALIDATION_RECHECK_S = 5.0   # revalidate every 5 seconds
-
-# All three criteria must pass together to validate:
-#   band energy ratio    ≥ VALIDATION_ENERGY   (of AC power lands in breathing band)
-#   peak concentration   ≥ VALIDATION_CONCENT  (single-frequency dominance)
-#   spectral SNR         ≥ VALIDATION_SNR_DB   (breathing peak vs noise floor)
-VALIDATION_ENERGY   = 0.25    # was 0.15 — raised to reject broadband drift
-VALIDATION_CONCENT  = 0.30    # dominant peak must hold 30% of band power
-VALIDATION_SNR_DB   = 6.0     # peak must be 6 dB above out-of-band noise
-
-# Tier 2 (slow breathers) uses relaxed thresholds
-VALIDATION_ENERGY_T2  = 0.18
-VALIDATION_CONCENT_T2 = 0.25
-VALIDATION_SNR_DB_T2  = 4.0
+BP_LO, BP_HI = 0.1, 0.6
 
 
 def _make_bandpass(lo, hi, fs, order=4):
@@ -73,101 +55,6 @@ def _estimate_bpm(signal_seg, fs):
     return float(f[band][np.argmax(mag[band])]) * 60.0
 
 
-def _breathing_energy_ratio(signal_seg, fs):
-    """Ratio of spectral energy in the breathing band to total energy.
-
-    Detrends first to reject slow drift from static objects.
-
-    Returns a value between 0 and 1:
-      >0.15 → likely breathing (sinusoidal pattern)
-      <0.05 → likely static object (wall, furniture)
-    """
-    if len(signal_seg) < 64:
-        return 0.0
-    sig = signal_seg.copy()
-    # Remove linear trend (drift from phase unwrap or static reflector)
-    t = np.arange(len(sig))
-    coeffs = np.polyfit(t, sig, 1)
-    sig = sig - np.polyval(coeffs, t)
-    sig = sig - sig.mean()
-
-    f = np.fft.rfftfreq(len(sig), d=1 / fs)
-    power = np.abs(np.fft.rfft(sig)) ** 2
-    total = float(np.sum(power[1:]))  # exclude DC
-    if total < 1e-12:
-        return 0.0
-    band = (f >= BP_LO) & (f <= BP_HI)
-    breathing = float(np.sum(power[band]))
-    return breathing / total
-
-
-def _spectral_peak_concentration(signal_seg, fs):
-    """How much of the breathing-band energy is in the single dominant peak.
-
-    A true sinusoid concentrates ~100% of energy in one FFT bin (plus small
-    leakage). A wall or clutter produces broadband noise where energy is
-    spread across many bins. Returns 0-1.
-
-    Values:
-      >0.35 → strong single-frequency component (real breathing)
-      <0.15 → broadband/noisy signal (wall, non-sinusoidal drift)
-    """
-    if len(signal_seg) < 64:
-        return 0.0
-    sig = signal_seg.copy()
-    t = np.arange(len(sig))
-    coeffs = np.polyfit(t, sig, 1)
-    sig = sig - np.polyval(coeffs, t)
-    sig = sig - sig.mean()
-
-    f = np.fft.rfftfreq(len(sig), d=1 / fs)
-    power = np.abs(np.fft.rfft(sig)) ** 2
-
-    band_mask = (f >= BP_LO) & (f <= BP_HI)
-    band_power = power[band_mask]
-    if band_power.sum() < 1e-12:
-        return 0.0
-
-    # Peak plus its 2 neighbors (accounting for spectral leakage from windowing)
-    peak_idx = int(np.argmax(band_power))
-    lo = max(0, peak_idx - 1)
-    hi = min(len(band_power), peak_idx + 2)
-    peak_power = float(band_power[lo:hi].sum())
-    return peak_power / float(band_power.sum())
-
-
-def _spectral_snr_db(signal_seg, fs):
-    """Ratio of dominant breathing-band peak to noise floor (dB).
-
-    Returns the ratio between the strongest bin inside the breathing band
-    and the median outside-band power. A real breather has SNR > 10 dB;
-    noise or clutter typically shows <5 dB.
-    """
-    if len(signal_seg) < 64:
-        return 0.0
-    sig = signal_seg.copy()
-    t = np.arange(len(sig))
-    coeffs = np.polyfit(t, sig, 1)
-    sig = sig - np.polyval(coeffs, t)
-    sig = sig - sig.mean()
-
-    f = np.fft.rfftfreq(len(sig), d=1 / fs)
-    power = np.abs(np.fft.rfft(sig)) ** 2
-    band = (f >= BP_LO) & (f <= BP_HI)
-    if not band.any():
-        return 0.0
-
-    peak = float(power[band].max())
-    # Noise floor: median power OUTSIDE the breathing band (above 0.6 Hz)
-    noise_band = (f > BP_HI) & (f < fs / 2 - 0.1)
-    if not noise_band.any() or power[noise_band].sum() < 1e-12:
-        return 0.0
-    noise = float(np.median(power[noise_band]))
-    if noise < 1e-12:
-        return 0.0
-    return float(10 * np.log10(peak / noise))
-
-
 @dataclass
 class Track:
     """Independent state for one tracked person."""
@@ -178,22 +65,14 @@ class Track:
     # Phase tracking (each track has its own unwrapper)
     prev_phase: float = 0.0
 
-    # History buffers — sized at track creation based on FPS × HISTORY_S
-    # (must accommodate BPM_WINDOW_S of samples plus margin)
-    phase_hist: deque = field(default_factory=lambda: deque(maxlen=3000))
-    disp_hist: deque = field(default_factory=lambda: deque(maxlen=3000))
-    time_hist: deque = field(default_factory=lambda: deque(maxlen=3000))
+    # History buffers
+    phase_hist: deque = field(default_factory=lambda: deque(maxlen=750))
+    disp_hist: deque = field(default_factory=lambda: deque(maxlen=750))
+    time_hist: deque = field(default_factory=lambda: deque(maxlen=750))
 
     # BPM
     bpm: float = 0.0
     _last_bpm_time: float = 0.0   # wall time of last BPM recomputation
-
-    # Breathing validation
-    breathing_validated: bool = False    # True once sinusoidal breathing confirmed
-    breathing_score: float = 0.0        # energy ratio (0–1)
-    peak_concentration: float = 0.0     # spectral peak concentration (0–1)
-    peak_snr_db: float = 0.0            # dB above out-of-band noise
-    _last_validation_time: float = 0.0
 
     # Lifecycle
     miss_count: int = 0
@@ -208,77 +87,6 @@ class Track:
     @property
     def range_m(self) -> float:
         return self.kalman.range_m
-
-    @property
-    def is_pending(self) -> bool:
-        """True if track is confirmed but not yet breathing-validated."""
-        return self.confirmed and not self.breathing_validated
-
-    def validate_breathing(self, fps: float):
-        """Check if this track's displacement shows a breathing pattern.
-
-        Three criteria (all must pass):
-          1. Energy in breathing band ≥ threshold
-          2. Spectral peak concentration ≥ threshold (real sinusoid, not noise)
-          3. Peak SNR above out-of-band floor ≥ threshold (dB)
-
-        Two-tier duration:
-          - Tier 1 (10s): catches normal breathing (≥6 BPM)
-          - Tier 2 (25s): relaxed thresholds for very slow breathing (≥3 BPM)
-        """
-        import time as _time
-        now = _time.monotonic()
-
-        # Don't recheck too frequently
-        if now - self._last_validation_time < VALIDATION_RECHECK_S:
-            return
-        self._last_validation_time = now
-
-        n_samples = len(self.disp_hist)
-        data_duration = n_samples / fps if fps > 0 else 0
-
-        if data_duration < VALIDATION_TIER1_S:
-            return
-
-        disp = np.array(self.disp_hist)
-        energy = _breathing_energy_ratio(disp, fps)
-        concent = _spectral_peak_concentration(disp, fps)
-        snr_db = _spectral_snr_db(disp, fps)
-
-        # Store for display / debugging
-        self.breathing_score = energy
-        self.peak_concentration = concent
-        self.peak_snr_db = snr_db
-
-        # Tier 1: normal breathing (all three strict thresholds)
-        tier1_pass = (energy >= VALIDATION_ENERGY and
-                      concent >= VALIDATION_CONCENT and
-                      snr_db  >= VALIDATION_SNR_DB)
-
-        if tier1_pass:
-            if not self.breathing_validated:
-                print(f"[TRACK] #{self.track_id} breathing VALIDATED tier 1  "
-                      f"E={energy:.2f} C={concent:.2f} SNR={snr_db:.1f}dB")
-            self.breathing_validated = True
-            return
-
-        # Tier 2: relaxed thresholds for slow breathers, requires 25+ s of data
-        if data_duration >= VALIDATION_TIER2_S:
-            tier2_pass = (energy >= VALIDATION_ENERGY_T2 and
-                          concent >= VALIDATION_CONCENT_T2 and
-                          snr_db  >= VALIDATION_SNR_DB_T2)
-            if tier2_pass:
-                if not self.breathing_validated:
-                    print(f"[TRACK] #{self.track_id} breathing VALIDATED tier 2  "
-                          f"E={energy:.2f} C={concent:.2f} SNR={snr_db:.1f}dB")
-                self.breathing_validated = True
-                return
-
-            # Revoke if it was previously validated but no longer meets criteria
-            if self.breathing_validated:
-                print(f"[TRACK] #{self.track_id} breathing REVOKED  "
-                      f"E={energy:.2f} C={concent:.2f} SNR={snr_db:.1f}dB")
-            self.breathing_validated = False
 
     def process_phase(self, rfft_avg: np.ndarray, t_rel: float,
                       lambda_m: float, fps: float, sos_bp,
@@ -476,63 +284,13 @@ class MultiTrackManager:
             indices = list(indices_arr)
 
         # Convert to global bin indices and refine
-        # First, keep peaks that pass width filter — track by (magnitude, bin)
-        candidates = []
+        peaks = []
         for idx_local in indices:
             idx_global = self.min_bin + int(idx_local)
-
-            # Peak shape filter — reject only very wide reflections
-            # (walls, floors). Sinusoid validation handles the rest.
-            if not self._peak_width_is_human(mag, idx_global):
-                continue
-
-            candidates.append((float(mag[idx_global]), idx_global))
-
-        # Sort by magnitude descending and keep top (max_tracks × 2) candidates
-        # — enough headroom for association but no runaway peak lists
-        candidates.sort(reverse=True)
-        max_candidates = max(self.max_tracks * 2, 6)
-        candidates = candidates[:max_candidates]
-
-        # Sub-bin refine each surviving candidate
-        peaks = []
-        for _, idx_global in candidates:
             refined = self._parabolic_refine(mag, idx_global)
             peaks.append(refined)
 
         return peaks
-
-    @staticmethod
-    def _peak_width_is_human(mag: np.ndarray, idx: int) -> bool:
-        """Test the -3 dB width of a peak in range bins.
-
-        Only rejects very wide reflections (walls, floors). Metal specular
-        returns are allowed to pass through — sinusoid validation will
-        catch them if they're not breathing.
-        """
-        if idx <= 0 or idx >= len(mag) - 1:
-            return False
-        peak = float(mag[idx])
-        if peak < 1e-9:
-            return False
-        threshold = peak * 0.5  # -6 dB point (more permissive than -3 dB)
-
-        left = idx
-        while left > 0 and mag[left - 1] > threshold:
-            left -= 1
-            if idx - left > 15:  # cap the search
-                break
-
-        right = idx
-        while right < len(mag) - 1 and mag[right + 1] > threshold:
-            right += 1
-            if right - idx > 15:
-                break
-
-        width_bins = right - left + 1
-        # Accept 1 to 8 bin widths at -6 dB. Wider than 8 bins (~60 cm) is
-        # almost certainly a wall or extended clutter.
-        return width_bins <= 8
 
     @staticmethod
     def _parabolic_refine(mag: np.ndarray, idx: int) -> float:
@@ -586,9 +344,7 @@ class MultiTrackManager:
             # Use Kalman position uncertainty for gating
             pos_sigma = np.sqrt(track.kalman.P[0, 0])
             gate = min(self.min_peak_sep, pos_sigma * self.kalman_kwargs.get("gate_sigma", 5.0))
-            # Floor at 5 bins (~40 cm) — accounts for natural peak jitter
-            # from breathing modulation of the range profile
-            gate = max(gate, 5.0)
+            gate = max(gate, 3.0)  # floor at 3 bins
             if dist > gate:
                 continue
             matched.append((track, peak))
@@ -678,11 +434,6 @@ class MultiTrackManager:
                                     self.fps, self.sos_bp, self.bpm_window_s,
                                     self.bpm_refresh_s)
 
-        # 5.5. Validate breathing pattern on all confirmed tracks
-        for track in self.tracks:
-            if track.confirmed:
-                track.validate_breathing(self.fps)
-
         # 6. Delete stale tracks BEFORE spawning new ones
         before = len(self.tracks)
         self.tracks = [t for t in self.tracks
@@ -707,23 +458,9 @@ class MultiTrackManager:
         return [t for t in self.tracks if t.confirmed]
 
     @property
-    def validated_tracks(self) -> List[Track]:
-        """Tracks with confirmed breathing pattern."""
-        return [t for t in self.tracks if t.confirmed and t.breathing_validated]
-
-    @property
-    def pending_tracks(self) -> List[Track]:
-        """Tracks confirmed but not yet breathing-validated."""
-        return [t for t in self.tracks if t.confirmed and not t.breathing_validated]
-
-    @property
     def all_tracks(self) -> List[Track]:
         return list(self.tracks)
 
     @property
     def num_confirmed(self) -> int:
         return sum(1 for t in self.tracks if t.confirmed)
-
-    @property
-    def num_validated(self) -> int:
-        return sum(1 for t in self.tracks if t.confirmed and t.breathing_validated)
