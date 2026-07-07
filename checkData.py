@@ -91,11 +91,17 @@ def capture_raw_data(host, port, n_frames):
 def parse_frame(raw_bytes):
     """Parse one frame into (TOTAL_CHIRPS, NUM_RX, NUM_ADC_SAMPLES) complex.
 
-    Complex1x format: I and Q as consecutive int16s, no padding.
+    Complex1x LVDS-interleaved format (openradar convention). Every 4
+    consecutive int16s contain the real and imaginary parts of TWO
+    complex samples:
+        raw[0], raw[1] → real parts of samples 0 and 1
+        raw[2], raw[3] → imaginary parts of samples 0 and 1
     """
     raw = np.frombuffer(raw_bytes[:RAW_BYTES_PER_FRAME], dtype=np.int16)
-    iq = raw[0::2].astype(np.float32) + 1j * raw[1::2].astype(np.float32)
-    return iq.reshape(TOTAL_CHIRPS, NUM_RX, NUM_ADC_SAMPLES)
+    ret = np.zeros(len(raw) // 2, dtype=np.complex64)
+    ret[0::2] = raw[0::4].astype(np.float32) + 1j * raw[2::4].astype(np.float32)
+    ret[1::2] = raw[1::4].astype(np.float32) + 1j * raw[3::4].astype(np.float32)
+    return ret.reshape(TOTAL_CHIRPS, NUM_RX, NUM_ADC_SAMPLES)
 
 
 def run_diagnostics(raw_data):
@@ -278,6 +284,85 @@ def run_diagnostics(raw_data):
     else:
         print(f"  ~ Phase pattern is irregular — check antenna connections")
 
+    # ── Check 5b: RX phase ramp WITHIN each TX ──
+    print(f"\n── Check 5b: RX-only phase ramp per TX ──")
+    print(f"  For a target off-boresight, phase across RX should ramp linearly.")
+    print(f"  Compare TX0-only ramp with TX2-only ramp.")
+
+    for tx_label, chirps in [("TX0", tx0_chirps), ("TX2", tx2_chirps)]:
+        rx_phases = []
+        for rx in range(NUM_RX):
+            avg_fft = np.mean(np.fft.fft(chirps[:, rx, :], axis=-1), axis=0)
+            rx_phases.append(float(np.degrees(np.angle(avg_fft[peak_bin]))))
+        # Unwrap for easier reading
+        unwrapped = np.unwrap(np.radians(rx_phases))
+        unwrapped_deg = np.degrees(unwrapped)
+        steps = np.diff(unwrapped_deg)
+        step_mean = float(np.mean(steps))
+        step_std = float(np.std(steps))
+        # For λ/2 spacing, phase step (deg) → angle θ from: step = 180 * sin(θ)
+        est_angle = float(np.degrees(np.arcsin(np.clip(step_mean / 180.0, -1, 1))))
+        phase_str = " ".join(f"{p:+6.1f}" for p in unwrapped_deg)
+        print(f"  {tx_label}: [{phase_str}]  step={step_mean:+.1f}°±{step_std:.1f}° "
+              f"→ θ≈{est_angle:+.1f}°")
+
+    # ── Check 5c: Full 8-element angle FFT (what the fan display sees) ──
+    print(f"\n── Check 5c: Angle spectrum from 8-element virtual array ──")
+    virtual = np.zeros(8, dtype=np.complex64)
+    for rx in range(NUM_RX):
+        avg_tx0 = np.mean(np.fft.fft(tx0_chirps[:, rx, :], axis=-1), axis=0)[peak_bin]
+        avg_tx2 = np.mean(np.fft.fft(tx2_chirps[:, rx, :], axis=-1), axis=0)[peak_bin]
+        virtual[rx] = avg_tx0
+        virtual[rx + 4] = avg_tx2
+
+    # Angle FFT
+    n_fft = 64
+    spectrum = np.fft.fftshift(np.fft.fft(virtual, n=n_fft))
+    mag_spec = np.abs(spectrum)
+    # Convert bins to angles
+    u = np.linspace(-1, 1, n_fft, endpoint=False)
+    angles = np.degrees(np.arcsin(np.clip(u, -1, 1)))
+
+    # Find peak and its -3dB width
+    peak_ang_idx = int(np.argmax(mag_spec))
+    peak_val = float(mag_spec[peak_ang_idx])
+    peak_angle = float(angles[peak_ang_idx])
+    # Half-power width
+    half = peak_val / np.sqrt(2)
+    left = peak_ang_idx
+    while left > 0 and mag_spec[left] > half:
+        left -= 1
+    right = peak_ang_idx
+    while right < len(mag_spec) - 1 and mag_spec[right] > half:
+        right += 1
+    hpbw = float(angles[right] - angles[left])
+    # SNR of peak vs. background
+    median_bg = float(np.median(mag_spec))
+    snr_db = 20 * np.log10(peak_val / (median_bg + 1e-9))
+
+    print(f"  Peak angle:  {peak_angle:+.1f}°")
+    print(f"  Peak/median: {snr_db:.1f} dB")
+    print(f"  HPBW:        {hpbw:.1f}°")
+    # Sample the spectrum at a few angles
+    print(f"  Angle spectrum sampled:")
+    for target_deg in [-45, -30, -15, 0, 15, 30, 45]:
+        ang_idx = int(np.argmin(np.abs(angles - target_deg)))
+        val_db = 20 * np.log10(mag_spec[ang_idx] / (peak_val + 1e-9))
+        bar = "█" * int(max(0, (val_db + 30) / 2))
+        print(f"    {target_deg:+4d}°: {val_db:+6.1f} dB  {bar}")
+
+    if snr_db < 6:
+        print(f"  ⚠ Peak barely above noise — angle spectrum is spread out.")
+        print(f"    This means the fan display will show lateral smearing.")
+        print(f"    Likely causes:")
+        print(f"    - TX0 and TX2 not actually producing distinct wavefronts")
+        print(f"    - RX indexing is scrambled (wrong element positions)")
+        print(f"    - Target has multiple angular components (multipath)")
+    elif hpbw > 25:
+        print(f"  ⚠ Peak is wide (>25°) — real spatial info present but noisy.")
+    else:
+        print(f"  ✓ Sharp angular peak — MIMO array is working correctly.")
+
     # ── Check 6: Frame-to-frame consistency ──
     if n_complete >= 2:
         print(f"\n── Check 6: Frame-to-frame consistency ──")
@@ -343,6 +428,8 @@ def main():
     ap.add_argument("--file", type=str, default=None,
                     help="read from a saved binary file instead of UDP")
     ap.add_argument("--frames", type=int, default=NUM_FRAMES_TO_CAPTURE)
+    ap.add_argument("--countdown", type=int, default=5,
+                    help="seconds to wait before capturing (get in position)")
     args = ap.parse_args()
 
     if args.file:
@@ -351,6 +438,19 @@ def main():
             raw = f.read()
         print(f"[FILE] {len(raw):,} bytes")
     else:
+        # Countdown so you can walk into position
+        if args.countdown > 0:
+            print("")
+            print("═" * 55)
+            print(f"  GET IN POSITION — capture starts in {args.countdown}s")
+            print(f"  Stand ~2 m from radar, ~30° off boresight,")
+            print(f"  clear of walls and other reflectors.")
+            print("═" * 55)
+            for i in range(args.countdown, 0, -1):
+                print(f"  {i}...", flush=True)
+                time.sleep(1)
+            print(f"  GO — capturing now")
+            print("")
         raw = capture_raw_data(args.host, args.port, args.frames)
 
     run_diagnostics(raw)

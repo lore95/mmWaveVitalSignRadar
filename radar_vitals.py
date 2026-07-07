@@ -86,8 +86,8 @@ CONFIRM_FRAMES    = 3
 DELETE_FRAMES     = 150         # 3 seconds at 50 Hz — coast through brief misses
 MIN_PEAK_SEP_BINS = 6     # ~45 cm at 7.5 cm/bin (person body diameter)
 MIN_TRACK_SEP_BINS = 4    # ~30 cm
-SNR_THRESHOLD_DB  = 10.0
-CFAR_K            = 4.0
+SNR_THRESHOLD_DB  = 15.0        # was 10 - clearly above noise floor
+CFAR_K            = 7.0         # was 4 - raised for 18 dB coherent integration gain
 
 # Adaptive background update (subtracts slow drift after calibration)
 # alpha = how much new data influences the running background each frame.
@@ -147,41 +147,62 @@ def angle_axis(n_fft: int = AOA_FFT_SIZE) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════
 
 def parse_one_frame(raw_bytes: bytes) -> np.ndarray:
-    """Parse Complex1x format frame: 192 chirps × 4 RX × 256 samples × 4 bytes.
+    """Parse Complex1x LVDS-interleaved format frame (openradar convention).
 
-    Frame layout: 64 loops, each loop contains 3 chirps (TX1, TX0, TX2 order).
-    Total 192 chirps per frame interleaved by TX.
+    The DCA1000 with 4 LVDS lanes packs data in an interleaved format
+    where every 4 int16s (8 bytes) contain the real and imaginary parts
+    of TWO consecutive complex samples:
+        raw[0], raw[1]  → real parts of samples 0 and 1
+        raw[2], raw[3]  → imaginary parts of samples 0 and 1
 
-    The captured signal is the complex conjugate of the intended
-    representation — targets appear at negative frequencies. We swap I
-    and Q (equivalent to conjugating + shifting) so that closer targets
-    map to lower range bins.
+    Reference: openradar mmwave.dataloader.DCA1000.organize()
+
+    Returns:
+        ndarray of shape (TOTAL_CHIRPS, NUM_RX, NUM_ADC_SAMPLES) complex.
     """
     raw = np.frombuffer(raw_bytes, dtype=np.int16)
-    # IQ swap: put Q in real part, I in imaginary part
-    iq = raw[1::2].astype(np.float32) + 1j * raw[0::2].astype(np.float32)
-    return iq.reshape(TOTAL_CHIRPS, NUM_RX, NUM_ADC_SAMPLES)
+    ret = np.zeros(len(raw) // 2, dtype=np.complex64)
+    ret[0::2] = raw[0::4].astype(np.float32) + 1j * raw[2::4].astype(np.float32)
+    ret[1::2] = raw[1::4].astype(np.float32) + 1j * raw[3::4].astype(np.float32)
+    return ret.reshape(TOTAL_CHIRPS, NUM_RX, NUM_ADC_SAMPLES)
 
 def separate_tx(frame: np.ndarray):
     """Separate the 192 interleaved chirps by TX.
 
-    Per Lua chirp config, each loop fires chirps in this order:
-      Chirp 0 → TX1 (elevated)
-      Chirp 1 → TX0
-      Chirp 2 → TX2
+    XWR1843BOOST antenna geometry (from TI datasheet Figure 10):
+
+        RX1 RX2 RX3 RX4  [DUMMY]  TX1        (TX2)       TX3
+              ← λ/2 →                                       ← horizontal line
+                                       λ/2 ↑ TX2 (elevation)
+                                  ← λ →      ← λ →
+
+    Board silkscreen labels shift by one from Studio names:
+        Board TX1 → Studio TX0 = AZIMUTH LEFT
+        Board TX2 → Studio TX1 = ELEVATION (offset UP by λ/2)
+        Board TX3 → Studio TX2 = AZIMUTH RIGHT
+
+    Board TX1 and Board TX3 (Studio TX0 and TX2) are the horizontal azimuth
+    pair separated by 2λ. Combined with 4 RX at λ/2 spacing, they form a
+    uniform 8-element ULA:
+        Studio TX0 covers virtual positions 0-3
+        Studio TX2 covers virtual positions 4-7
+
+    Chirp order in the Lua script:
+        ChirpConfig(0, ..., 0, 1, 0)  → tx2Enable = Studio TX1 fires (elevation)
+        ChirpConfig(1, ..., 1, 0, 0)  → tx1Enable = Studio TX0 fires (azimuth L)
+        ChirpConfig(2, ..., 0, 0, 1)  → tx3Enable = Studio TX2 fires (azimuth R)
 
     With 64 loops, frame layout is:
-      [TX1_0, TX0_0, TX2_0, TX1_1, TX0_1, TX2_1, ..., TX1_63, TX0_63, TX2_63]
+        [TX1_0, TX0_0, TX2_0, TX1_1, TX0_1, TX2_1, ..., TX1_63, TX0_63, TX2_63]
 
-    Returns:
-        tx0: (64, 4, 256) — all TX0 chirps
-        tx1: (64, 4, 256) — all TX1 chirps (elevation antenna, used for SNR only)
-        tx2: (64, 4, 256) — all TX2 chirps
+    Returns (tx0, tx1, tx2) in Studio naming.
+    Downstream code combines tx0 + tx2 for azimuth AoA; tx1 (elevation) is
+    used only to boost the range profile SNR.
     """
-    tx1 = frame[0::3]   # chirps 0, 3, 6, ... = TX1
-    tx0 = frame[1::3]   # chirps 1, 4, 7, ... = TX0
-    tx2 = frame[2::3]   # chirps 2, 5, 8, ... = TX2
-    return tx0, tx1, tx2
+    tx1_elev = frame[0::3]   # chirp 0 in each loop = Studio TX1 = elevation
+    tx0_az_L = frame[1::3]   # chirp 1 = Studio TX0 = azimuth left
+    tx2_az_R = frame[2::3]   # chirp 2 = Studio TX2 = azimuth right
+    return tx0_az_L, tx1_elev, tx2_az_R
 
 def compute_range_fft(chirps: np.ndarray, win: np.ndarray) -> np.ndarray:
     dc = chirps.mean(axis=-1, keepdims=True)
@@ -203,17 +224,20 @@ def compute_range_angle_map(virtual: np.ndarray, n_fft: int = AOA_FFT_SIZE) -> n
     mag = np.abs(angle_fft)
     return 20 * np.log10(mag + 1e-6)
 
-def estimate_aoa(rfft_tx0: np.ndarray, rfft_tx2: np.ndarray,
+def estimate_aoa(rfft_az_left: np.ndarray, rfft_az_right: np.ndarray,
                  bin_idx: int, n_fft: int = AOA_FFT_SIZE) -> float:
-    """Azimuth AoA from TX0 + TX2 virtual array (8 elements at λ/2 spacing).
+    """Azimuth AoA from the 8-element virtual array (λ/2 spacing).
 
-    On the XWR1843, TX0 and TX2 are 2λ apart horizontally,
-    giving a uniform 8-element ULA when combined with the 4 RX.
+    On the XWR1843, board TX1 (Studio TX0) and board TX2 (Studio TX1) are
+    the horizontal azimuth pair separated by λ. Combined with the 4 RX at
+    λ/2 spacing, this yields a uniform 8-element ULA where:
+        Studio TX0 covers virtual positions 0-3
+        Studio TX1 covers virtual positions 4-7
     """
-    idx = min(bin_idx, rfft_tx0.shape[1] - 1)
+    idx = min(bin_idx, rfft_az_left.shape[1] - 1)
     virtual = np.zeros(8, dtype=np.complex64)
-    virtual[0:4] = rfft_tx0[:, idx]
-    virtual[4:8] = rfft_tx2[:, idx]
+    virtual[0:4] = rfft_az_left[:, idx]
+    virtual[4:8] = rfft_az_right[:, idx]
     spectrum = np.fft.fftshift(np.fft.fft(virtual, n=n_fft))
     angles = angle_axis(n_fft)
     peak_idx = int(np.argmax(np.abs(spectrum)))
@@ -411,14 +435,22 @@ class DemoSource(threading.Thread):
                                  1j*np.random.randn(NUM_ADC_SAMPLES)) * 5
                         frame_iq[ci, rx, :] = t1 + t2 + noise
 
-            # Pack as Complex1x: alternating I and Q int16s (no zero padding)
+            # Pack as Complex1x LVDS-interleaved format (openradar convention).
+            # For each pair of samples, layout is:
+            #   int16[0] = real[sample0]
+            #   int16[1] = real[sample1]
+            #   int16[2] = imag[sample0]
+            #   int16[3] = imag[sample1]
             flat = frame_iq.reshape(-1)
-            raw = np.empty(len(flat) * 2, dtype=np.int16)
-            # Need to match the IQ swap done in parser: parser does
-            #   iq = raw[1::2] + 1j * raw[0::2]
-            # So we need to store imag at [0::2] and real at [1::2]
-            raw[0::2] = np.round(flat.imag).astype(np.int16)
-            raw[1::2] = np.round(flat.real).astype(np.int16)
+            n_samples = len(flat)
+            raw = np.empty(n_samples * 2, dtype=np.int16)
+            # Pair up: s0 at index 2p, s1 at index 2p+1
+            s0 = flat[0::2]
+            s1 = flat[1::2]
+            raw[0::4] = np.round(s0.real).astype(np.int16)
+            raw[1::4] = np.round(s1.real).astype(np.int16)
+            raw[2::4] = np.round(s0.imag).astype(np.int16)
+            raw[3::4] = np.round(s1.imag).astype(np.int16)
             with self.lock:
                 self.buf.extend(raw.tobytes())
             self.frame_idx += 1
@@ -723,22 +755,29 @@ def main():
                 frame = parse_one_frame(raw_chunk)
                 wall_now = time.monotonic()
 
-                # Separate the 3 TX chirps
+                # Separate chirps by TX. After separate_tx() the returned
+                # variables (in Studio TX naming) are:
+                #   tx0_chirps = Studio TX0 = AZIMUTH LEFT (board TX1)
+                #   tx1_chirps = Studio TX1 = ELEVATION (board TX2, offset ↑ λ/2)
+                #   tx2_chirps = Studio TX2 = AZIMUTH RIGHT (board TX3)
                 tx0_chirps, tx1_chirps, tx2_chirps = separate_tx(frame)
 
-                # Range FFT for each TX (averaged across the 1 chirp it has)
-                rfft_tx0 = compute_range_fft(tx0_chirps, win_hann)  # (4, n_bins)
-                rfft_tx1 = compute_range_fft(tx1_chirps, win_hann)  # (4, n_bins)
-                rfft_tx2 = compute_range_fft(tx2_chirps, win_hann)  # (4, n_bins)
+                # Range FFT for each TX group (coherently averaged over 64 chirps)
+                rfft_tx0 = compute_range_fft(tx0_chirps, win_hann)  # (4, n_bins) — azimuth L
+                rfft_tx1 = compute_range_fft(tx1_chirps, win_hann)  # (4, n_bins) — elevation
+                rfft_tx2 = compute_range_fft(tx2_chirps, win_hann)  # (4, n_bins) — azimuth R
 
+                # Save the two AZIMUTH range FFTs for AoA.
                 last_rfft_tx0 = rfft_tx0
                 last_rfft_tx2 = rfft_tx2
 
-                # Azimuth virtual array (TX0+TX2) for AoA: 8 elements at λ/2
+                # 8-element azimuth virtual array: TX0 (left) + TX2 (right).
+                # TX0 and TX2 are separated by 2λ horizontally; combined
+                # with 4 RX at λ/2 spacing this forms a uniform 8-element ULA.
                 azimuth_virtual = np.concatenate([rfft_tx0, rfft_tx2], axis=0)
 
-                # Full 12-element virtual (TX0+TX1+TX2) for max-SNR range profile.
-                # TX1 is elevation-offset so we use it only for range/SNR, not AoA.
+                # Full 12-element virtual (all 3 TX) for max-SNR range profile.
+                # The elevation antenna (rfft_tx1) adds signal energy but not azimuth info.
                 virtual = np.concatenate([rfft_tx0, rfft_tx1, rfft_tx2], axis=0)
 
                 # 1D range profile (averaged across virtual elements)
@@ -769,6 +808,13 @@ def main():
                     bg_frames_buf.clear()
                     print(f"[RADAR] background done ({BG_FRAMES} frames, "
                           f"12 virtual elements, 8 used for azimuth)")
+                    # Diagnostic — noise floor stats to help tune CFAR
+                    noise_median = float(np.median(bg_noise_std[search_min_bin:search_max_bin]))
+                    noise_max = float(np.max(bg_noise_std[search_min_bin:search_max_bin]))
+                    cfar_thr_median = CFAR_K * noise_median
+                    print(f"[RADAR] noise floor σ: median={noise_median:.1f}  max={noise_max:.1f}")
+                    print(f"[RADAR] CFAR threshold (k={CFAR_K}): median={cfar_thr_median:.1f}")
+                    print(f"[RADAR] any peak above this will be considered a detection")
 
                 # Background subtraction on full 12-element virtual array
                 diff_virtual = virtual - bg_virtual_saved  # (12, n_bins)
@@ -794,16 +840,38 @@ def main():
                     am = alpha_mask[np.newaxis, :]
                     bg_virtual_saved = ((1 - am) * bg_virtual_saved + am * virtual)
 
-                # 1D range profile from all 12 elements (max SNR)
+                # ── Two-pipeline processing ──
+                #
+                # DETECTION pipeline: uses bg-subtracted data to find where
+                # moving/new targets are, since static clutter dominates
+                # the raw magnitude and would hide people.
+                #
+                # PHASE EXTRACTION pipeline: uses RAW range FFT (no bg
+                # subtraction) at the detected bin, preserving the phase
+                # information needed for sub-millimeter chest displacement
+                # measurement. Subtracting a complex background before phase
+                # extraction distorts the phase because the vector
+                # subtraction shifts the argument of the residual.
+
+                # Detection: bg-subtracted 1D range profile
                 diff_avg = diff_virtual.mean(axis=0)
-                mag = np.abs(diff_avg)
-                mag_db = 20 * np.log10(mag + 1e-6)
+                mag_det = np.abs(diff_avg)         # for peak detection
+                mag_db = 20 * np.log10(mag_det + 1e-6)
                 range_profile_db = mag_db[keep_mask]
 
-                # 2D range-angle map from azimuth subarray only (TX0+TX2 = elements 0-3 and 8-11)
+                # Phase extraction: raw complex range FFT (no bg subtraction)
+                # We use only the 8 azimuth virtual elements (Studio TX0 + TX2)
+                # so the phase reflects the true round-trip phase from the
+                # broadside of the chest, without elevation-antenna contamination.
+                azimuth_raw = np.concatenate([rfft_tx0, rfft_tx2], axis=0)   # (8, n_bins)
+                rfft_avg_raw = azimuth_raw.mean(axis=0)   # complex (n_bins,)
+
+                # 2D range-angle map from azimuth subarray only (bg-subtracted).
+                # In the 12-elem virtual, elements 0-3 = TX0 (az L), 4-7 = TX1
+                # (elevation, skip), 8-11 = TX2 (az R). Take 0-3 and 8-11.
                 azimuth_diff = np.concatenate([diff_virtual[0:4],
                                                 diff_virtual[8:12]], axis=0)
-                ra_full = compute_range_angle_map(azimuth_diff)  # (AOA_FFT_SIZE, n_bins)
+                ra_full = compute_range_angle_map(azimuth_diff)
                 ra_map_db = ra_full[angle_mask][:, keep_mask]
 
                 # Track manager init
@@ -828,9 +896,11 @@ def main():
                         txt_status.set_text("detecting targets…")
                     print("[RADAR] track manager ready (MIMO + 2D)")
 
-                track_mgr.step(mag, diff_avg, t_rel)
+                # Detection uses bg-subtracted magnitude; phase extraction
+                # uses raw complex range FFT (preserves true phase).
+                track_mgr.step(mag_det, rfft_avg_raw, t_rel)
 
-                # AoA per track
+                # AoA per track — use the two azimuth-plane range FFTs (TX0 + TX2)
                 if last_rfft_tx0 is not None:
                     for trk in track_mgr.confirmed_tracks:
                         bi = int(round(trk.bin_position))
