@@ -13,8 +13,8 @@ A stripped-down version of the main monitor with:
 Recorded files are .npz archives that can be loaded with numpy.
 
 Usage:
-  python recording_sessions.py
-  python recording_sessions.py --no-radar --belt-only  # for testing UI without radar
+  python record_ui.py
+  python record_ui.py --no-radar --belt-only  # for testing UI without radar
 """
 
 import argparse
@@ -25,6 +25,7 @@ import os
 import sys
 import collections
 import json
+import csv
 from datetime import datetime
 
 import numpy as np
@@ -227,58 +228,86 @@ class Recorder:
         self.recording = False
         duration = time.monotonic() - self.t_start
         n_frames = len(self.frame_times)
-        path = os.path.join(self.out_dir, f"{self.session_name}.npz")
+        base = os.path.join(self.out_dir, self.session_name)
 
         print(f"[REC] STOP   {n_frames} frames  {duration:.1f}s → saving…")
 
-        # Convert track snapshots to arrays for compact storage
-        # Each snapshot is a list of dicts with fields:
-        #   track_id, range_m, angle_deg, bpm, validated, breathing_score, snr_db
-        # Flatten to columnar arrays (one row per (frame, track))
-        rows_frame_idx = []
-        rows_track_id = []
-        rows_range_m = []
-        rows_angle_deg = []
-        rows_bpm = []
-        rows_validated = []
-        rows_score = []
-        rows_snr_db = []
-        for fi, snap in enumerate(self.track_snapshots):
-            for trk in snap:
-                rows_frame_idx.append(fi)
-                rows_track_id.append(trk["track_id"])
-                rows_range_m.append(trk["range_m"])
-                rows_angle_deg.append(trk["angle_deg"])
-                rows_bpm.append(trk["bpm"])
-                rows_validated.append(1 if trk["validated"] else 0)
-                rows_score.append(trk["breathing_score"])
-                rows_snr_db.append(trk["snr_db"])
+        # ── 1. Track data → CSV ──────────────────────────────────────
+        # One row per (frame, track) observation. Includes a frame_time
+        # column for convenience (avoids join with frame_times array).
+        csv_path = f"{base}_tracks.csv"
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "frame_idx",       # 0-based frame counter
+                "frame_time_s",    # seconds since session start
+                "track_id",
+                "range_m",
+                "angle_deg",
+                "bpm",
+                "validated",       # 1 if breathing pattern confirmed, else 0
+                "breathing_score", # 0-1 spectral concentration
+                "snr_db",          # spectral SNR of breathing peak
+            ])
+            for fi, snap in enumerate(self.track_snapshots):
+                t = self.frame_times[fi] if fi < len(self.frame_times) else 0.0
+                for trk in snap:
+                    w.writerow([
+                        fi,
+                        f"{t:.4f}",
+                        trk["track_id"],
+                        f"{trk['range_m']:.3f}",
+                        f"{trk['angle_deg']:.2f}",
+                        f"{trk['bpm']:.2f}",
+                        1 if trk["validated"] else 0,
+                        f"{trk['breathing_score']:.4f}",
+                        f"{trk['snr_db']:.2f}",
+                    ])
 
+        # ── 2. Metadata → JSON ───────────────────────────────────────
+        meta_path = f"{base}_meta.json"
+        meta_out = dict(self.metadata)   # copy
+        meta_out["session"] = {
+            "name": self.session_name,
+            "duration_s": round(duration, 2),
+            "n_frames": n_frames,
+            "mode": self.mode,
+            "files": {
+                "tracks_csv": os.path.basename(csv_path),
+            }
+        }
+
+        # ── 3. Signal data → NPZ (only in summary+ mode) ─────────────
+        # Range profiles are always saved (small, high analysis value).
+        # Raw ADC only saved in full mode.
+        npz_path = f"{base}_signals.npz"
         save_dict = {
             "frame_times": np.array(self.frame_times, dtype=np.float64),
             "range_profiles": np.array(self.range_profiles, dtype=np.float32),
-            "track_frame_idx": np.array(rows_frame_idx, dtype=np.int32),
-            "track_id": np.array(rows_track_id, dtype=np.int32),
-            "track_range_m": np.array(rows_range_m, dtype=np.float32),
-            "track_angle_deg": np.array(rows_angle_deg, dtype=np.float32),
-            "track_bpm": np.array(rows_bpm, dtype=np.float32),
-            "track_validated": np.array(rows_validated, dtype=np.int8),
-            "track_breathing_score": np.array(rows_score, dtype=np.float32),
-            "track_snr_db": np.array(rows_snr_db, dtype=np.float32),
-            "metadata_json": np.array(json.dumps(self.metadata)),
         }
-
         if self.mode == "full":
-            # Concatenate raw frame bytes into one big array
             raw_all = b"".join(self.raw_frames)
             save_dict["raw_adc"] = np.frombuffer(raw_all, dtype=np.int16).copy()
             save_dict["frame_layout"] = np.array(
                 [TOTAL_CHIRPS, NUM_RX, NUM_ADC_SAMPLES], dtype=np.int32)
 
-        np.savez_compressed(path, **save_dict)
-        size_mb = os.path.getsize(path) / 1024 / 1024
-        print(f"[REC] SAVED  {path}  ({size_mb:.1f} MB)")
-        return path
+        np.savez_compressed(npz_path, **save_dict)
+        meta_out["session"]["files"]["signals_npz"] = os.path.basename(npz_path)
+
+        with open(meta_path, "w") as f:
+            json.dump(meta_out, f, indent=2)
+        meta_out["session"]["files"]["metadata_json"] = os.path.basename(meta_path)
+
+        # Sizes for feedback
+        csv_mb   = os.path.getsize(csv_path)  / 1024 / 1024
+        npz_mb   = os.path.getsize(npz_path)  / 1024 / 1024
+        meta_kb  = os.path.getsize(meta_path) / 1024
+
+        print(f"[REC] SAVED:")
+        print(f"        tracks:    {csv_path}  ({csv_mb:.2f} MB)")
+        print(f"        signals:   {npz_path}  ({npz_mb:.1f} MB)")
+        print(f"        metadata:  {meta_path}  ({meta_kb:.1f} KB)")
+        return base
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -428,12 +457,13 @@ def main():
     def on_stop(_):
         if not recorder.recording:
             return
-        path = recorder.stop()
+        base = recorder.stop()
         btn_start.ax.set_facecolor("#00b050")
         btn_start.label.set_color("white")
         btn_stop.ax.set_facecolor("#333")
         btn_stop.label.set_color("#888")
-        txt_rec_status.set_text(f"not recording — saved to\n{os.path.basename(path)}")
+        txt_rec_status.set_text(
+            f"not recording — saved as\n{os.path.basename(base)}_tracks.csv (+meta.json, +signals.npz)")
         txt_rec_status.set_color("#00ff99")
 
     btn_start.on_clicked(on_start)
