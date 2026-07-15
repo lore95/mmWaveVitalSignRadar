@@ -52,17 +52,41 @@ TRACK_COLORS = [
 def find_session(sessions_dir, name_hint=None):
     """Locate a session's file trio (tracks.csv, meta.json, signals.npz).
 
-    If name_hint is None, picks the most recent tracks.csv in sessions_dir.
+    Supports both flat layout (recordings/session_X_tracks.csv) and the
+    folder-per-session layout (recordings/session_X/session_X_tracks.csv).
+
+    If name_hint is None, picks the most recent tracks.csv (searching
+    recursively so it finds files inside per-session folders).
     """
     if name_hint:
         # Strip trailing suffixes if user pasted a full filename
         base = name_hint
-        for suffix in ("_tracks.csv", "_meta.json", "_signals.npz", ".csv", ".json", ".npz"):
+        for suffix in ("_tracks.csv", "_meta.json", "_signals.npz",
+                       ".csv", ".json", ".npz"):
             if base.endswith(suffix):
                 base = base[:-len(suffix)]
-        base = os.path.join(sessions_dir, os.path.basename(base))
+        # Try folder layout first: recordings_dir/base/base_tracks.csv
+        session_name = os.path.basename(base)
+        nested = os.path.join(sessions_dir, session_name, session_name)
+        flat = os.path.join(sessions_dir, session_name)
+        if os.path.exists(nested + "_tracks.csv"):
+            base = nested
+        elif os.path.exists(flat + "_tracks.csv"):
+            base = flat
+        else:
+            # Try recursive glob as a last resort (handles other layouts)
+            candidates = sorted(glob.glob(
+                os.path.join(sessions_dir, "**", session_name + "_tracks.csv"),
+                recursive=True))
+            if candidates:
+                base = candidates[0][:-len("_tracks.csv")]
+            else:
+                print(f"ERROR: could not find _tracks.csv for '{name_hint}'")
+                sys.exit(1)
     else:
-        csv_files = sorted(glob.glob(os.path.join(sessions_dir, "*_tracks.csv")))
+        # Search recursively so we catch both flat and nested layouts
+        csv_files = sorted(glob.glob(
+            os.path.join(sessions_dir, "**", "*_tracks.csv"), recursive=True))
         if not csv_files:
             print(f"ERROR: no *_tracks.csv files in {sessions_dir}")
             sys.exit(1)

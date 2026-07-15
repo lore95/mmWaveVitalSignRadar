@@ -33,7 +33,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from matplotlib.widgets import Button, RadioButtons
+from matplotlib.widgets import Button, RadioButtons, TextBox
 
 from kalman_tracker import KalmanPeakTracker
 from multi_track_manager import MultiTrackManager, TRACK_COLORS
@@ -199,25 +199,67 @@ class Recorder:
         self.frame_times = []        # wall time per frame (monotonic - epoch)
         self.raw_frames = []         # only in full mode
         self.range_profiles = []     # magnitude, bg-subtracted (1D array per frame)
+        # Complex range FFTs per virtual element BEFORE bg subtraction and
+        # angle FFT — lets replay reconstruct the fan and change AoA later.
+        # Shape per frame: (12, n_bins) complex64
+        self.range_complex_frames = []
         self.track_snapshots = []    # per-frame list of dicts
         self.session_name = None
         self.metadata = {}
 
-    def start(self, mode, metadata):
+    @staticmethod
+    def sanitize_description(desc, max_len=20):
+        """Turn free-form description into a filename-safe suffix.
+
+        Rules:
+          - Lowercase, spaces → underscores
+          - Drop anything that isn't alphanumeric, underscore, or dash
+          - Collapse multiple underscores
+          - Trim to max_len characters
+          - Empty result yields empty string (no dangling underscore)
+        """
+        if not desc:
+            return ""
+        s = desc.strip().lower().replace(" ", "_")
+        s = "".join(ch for ch in s if ch.isalnum() or ch in "_-")
+        # Collapse consecutive underscores
+        while "__" in s:
+            s = s.replace("__", "_")
+        s = s.strip("_-")
+        return s[:max_len]
+
+    def start(self, mode, metadata, description=""):
         self.reset()
         self.recording = True
         self.mode = mode
         self.t_start = time.monotonic()
-        self.metadata = metadata
-        self.session_name = datetime.now().strftime("session_%Y%m%d_%H%M%S")
+        self.metadata = dict(metadata)
+        self.metadata["description"] = description
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        desc_slug = self.sanitize_description(description, max_len=20)
+        if desc_slug:
+            self.session_name = f"session_{stamp}_{desc_slug}"
+        else:
+            self.session_name = f"session_{stamp}"
         print(f"[REC] START  mode={mode}  → {self.session_name}")
 
-    def push(self, t_rel, raw_bytes, range_profile_mag, track_snapshot):
-        """Buffer one frame's data."""
+    def push(self, t_rel, raw_bytes, range_profile_mag, range_complex, track_snapshot):
+        """Buffer one frame's data.
+
+        Args:
+            t_rel: seconds since session start
+            raw_bytes: raw ADC bytes (used only in full mode)
+            range_profile_mag: (n_bins,) float magnitude, bg-subtracted
+            range_complex: (12, n_bins) complex64 range FFT per virtual element,
+                           BEFORE bg subtraction. Enables offline replay.
+            track_snapshot: list of per-track dicts for this frame
+        """
         if not self.recording:
             return
         self.frame_times.append(t_rel)
         self.range_profiles.append(range_profile_mag.astype(np.float32))
+        self.range_complex_frames.append(range_complex.astype(np.complex64))
         self.track_snapshots.append(track_snapshot)
         if self.mode == "full":
             self.raw_frames.append(raw_bytes)
@@ -228,7 +270,11 @@ class Recorder:
         self.recording = False
         duration = time.monotonic() - self.t_start
         n_frames = len(self.frame_times)
-        base = os.path.join(self.out_dir, self.session_name)
+
+        # Create a folder per session; files inside share the session name.
+        session_dir = os.path.join(self.out_dir, self.session_name)
+        os.makedirs(session_dir, exist_ok=True)
+        base = os.path.join(session_dir, self.session_name)
 
         print(f"[REC] STOP   {n_frames} frames  {duration:.1f}s → saving…")
 
@@ -277,13 +323,17 @@ class Recorder:
             }
         }
 
-        # ── 3. Signal data → NPZ (only in summary+ mode) ─────────────
-        # Range profiles are always saved (small, high analysis value).
-        # Raw ADC only saved in full mode.
+        # ── 3. Signal data → NPZ (always saved) ──────────────────────
+        # Range profiles + complex range FFTs are always saved. Raw ADC
+        # only saved in full mode.
         npz_path = f"{base}_signals.npz"
         save_dict = {
             "frame_times": np.array(self.frame_times, dtype=np.float64),
             "range_profiles": np.array(self.range_profiles, dtype=np.float32),
+            # (n_frames, 12, n_bins) complex64. This is the key data for
+            # offline replay — everything downstream of the range FFT can
+            # be recomputed from it.
+            "range_complex": np.array(self.range_complex_frames, dtype=np.complex64),
         }
         if self.mode == "full":
             raw_all = b"".join(self.raw_frames)
@@ -410,6 +460,44 @@ def main():
         transform=ax_status.transAxes, ha="right", va="bottom",
         color="#666", fontsize=9)
 
+    # ── Description text box ──
+    # Positioned at the bottom, above the mode/buttons row.
+    # Max 20 chars used from this string when forming the folder name.
+    ax_desc_label = fig.add_axes([0.05, 0.28, 0.20, 0.03])
+    ax_desc_label.set_facecolor("#1a1a2e")
+    ax_desc_label.set_xticks([]); ax_desc_label.set_yticks([])
+    for sp in ax_desc_label.spines.values():
+        sp.set_visible(False)
+    ax_desc_label.text(0.0, 0.5, "description (max 20 chars):",
+                       transform=ax_desc_label.transAxes, va="center",
+                       color="#aaa", fontsize=10)
+
+    ax_desc = fig.add_axes([0.27, 0.28, 0.65, 0.04])
+    ax_desc.set_facecolor("#16213e")
+    txtbox_desc = TextBox(ax_desc, "", initial="",
+                          color="#16213e", hovercolor="#1e2a4a",
+                          textalignment="left")
+    txtbox_desc.text_disp.set_color("white")
+    txtbox_desc.text_disp.set_fontsize(10)
+    for sp in ax_desc.spines.values():
+        sp.set_color("#333")
+
+    # Live preview of what folder name will be generated
+    txt_preview = fig.text(0.27, 0.245,
+                           "→ session_YYYYMMDD_HHMMSS",
+                           color="#666", fontsize=8)
+
+    def on_desc_change(text):
+        slug = Recorder.sanitize_description(text, max_len=20)
+        stamp = "YYYYMMDD_HHMMSS"
+        if slug:
+            txt_preview.set_text(f"→ session_{stamp}_{slug}")
+        else:
+            txt_preview.set_text(f"→ session_{stamp}")
+        fig.canvas.draw_idle()
+
+    txtbox_desc.on_text_change(on_desc_change)
+
     # ── Buttons ──
     ax_mode = fig.add_axes([0.05, 0.05, 0.20, 0.18])
     ax_mode.set_facecolor("#16213e")
@@ -435,6 +523,7 @@ def main():
         if recorder.recording:
             return
         mode = radio_mode.value_selected
+        description = txtbox_desc.text.strip()
         metadata = {
             "notes": args.notes,
             "start_time": datetime.now().isoformat(),
@@ -447,7 +536,7 @@ def main():
                 "calibration_loaded": tx2_phase_correction is not None,
             },
         }
-        recorder.start(mode, metadata)
+        recorder.start(mode, metadata, description=description)
         btn_start.ax.set_facecolor("#333")
         btn_start.label.set_color("#888")
         btn_stop.ax.set_facecolor("#c53030")
@@ -462,9 +551,12 @@ def main():
         btn_start.label.set_color("white")
         btn_stop.ax.set_facecolor("#333")
         btn_stop.label.set_color("#888")
+        session_name = os.path.basename(base)
         txt_rec_status.set_text(
-            f"not recording — saved as\n{os.path.basename(base)}_tracks.csv (+meta.json, +signals.npz)")
+            f"saved to {session_name}/  (tracks.csv, meta.json, signals.npz)")
         txt_rec_status.set_color("#00ff99")
+        # Clear the description textbox so it's ready for the next session
+        txtbox_desc.set_val("")
 
     btn_start.on_clicked(on_start)
     btn_stop.on_clicked(on_stop)
@@ -566,8 +658,10 @@ def main():
             this_range_profile = mag_det
             this_raw = raw_chunk
 
-            # Feed the recorder
-            recorder.push(t_rel, this_raw, this_range_profile, snapshot)
+            # Feed the recorder — save the pre-bg-subtraction complex range
+            # FFTs per virtual element so offline replay can vary bg subtraction
+            # and AoA settings independently.
+            recorder.push(t_rel, this_raw, this_range_profile, virtual, snapshot)
 
         # ── Update UI ──
         if track_mgr is not None and bg_virtual_saved is not None:
@@ -613,8 +707,10 @@ def main():
                 mb = n * RAW_BYTES_PER_FRAME / 1024 / 1024
                 txt_size.set_text(f"est. {mb:.0f} MB")
             else:
-                # summary: range profile (n_bins × 4 bytes) + small overhead per frame
-                mb = n * n_bins * 4 / 1024 / 1024
+                # summary now includes complex range FFTs (12 elem × n_bins × 8 bytes)
+                # plus 1D range profile (n_bins × 4 bytes)
+                per_frame = 12 * n_bins * 8 + n_bins * 4
+                mb = n * per_frame / 1024 / 1024
                 txt_size.set_text(f"est. {mb:.1f} MB")
         else:
             txt_duration.set_text("")
@@ -624,8 +720,10 @@ def main():
                         cache_frame_data=False)
 
     print("\n[MAIN] recorder UI running")
-    print("[MAIN]   summary mode = ~1 MB/minute (track state + range profiles)")
+    print("[MAIN]   summary mode = ~40 MB/minute (tracks + complex range FFTs)")
+    print("[MAIN]                    ↳ enough to replay offline with different algorithms")
     print("[MAIN]   full mode    = ~2.3 GB/minute (adds raw ADC frames)")
+    print("[MAIN]                    ↳ enough to also change range-FFT parameters")
     print()
 
     try:
