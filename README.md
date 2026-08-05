@@ -221,7 +221,7 @@ Coherent averaging assumes the target barely moves within a 1.28-second frame (w
 
 The TX0 and TX2 signal paths have dierent PCB routing lengths and therefore dierent phase osets. Without correction, the concatenated 8-element virtual array has a phase discontinuity at the _v_ 3 _→ v_ 4 boundary that causes the angle FFT to place a spurious peak near _±_ 90<sup>_◦_</sup> . 
 
-The calibration script calibrate_tx_phase.py measures four per-RX correction factors (one for each RX channel, capturing PCB routing dierences) using a stationary reference target at boresight. The correction is stored in radar_phase_calibration.npz and applied per frame: 
+The calibration script calibrate_phase.py measures four per-RX correction factors (one for each RX channel, capturing PCB routing dierences) using a stationary reference target at boresight. The correction is stored in radar_phase_calibration.npz and applied per frame: 
 
 <mark>if tx2_phase_correction is not None:</mark> 
 
@@ -277,10 +277,10 @@ For each conrmed track the tracker also produces an azimuth angle estimate. The
 
 |File|Purpose|
 |---|---|
-|multi_breathing_monitor.py|Live monitoring application. Opens UDP socket, runs the full pipeline<br>(parse_→_range FFT_→_tracking_→_BPM), and displays the fan-shaped<br>range-angle heatmap with per-track BPM readouts.|
+|radar_vitals.py|Live monitoring application. Opens UDP socket, runs the full pipeline<br>(parse_→_range FFT_→_tracking_→_BPM), and displays the fan-shaped<br>range-angle heatmap with per-track BPM readouts.|
 |multi_track_manager.py|MultiTrackManager and Track classes. Implements CFAR peak de-<br>tection, nearest-neighbour association, Kalman-ltered range tracking,<br>phase extraction, BPM estimation, and sinusoidal validation.|
 |kalman_tracker.py|Constant-velocity Kalman lter over range-bin position. Position un-<br>certainty is capped to prevent runaway growth during coasting.|
-|mimo_diagnostic.py|Standalone diagnostic that captures 50 frames from the DCA1000 and<br>reports RX cross-correlations, TX0 vs TX2 correlations, per-RX phase<br>ramps, and a full angle FFT spectrum. Used to verify the MIMO array<br>is producing spatially diverse data.|
+|checkData.py|Standalone diagnostic that captures frames from the DCA1000 and<br>reports RX cross-correlations, TX0 vs TX2 correlations, per-RX phase<br>ramps, and a full angle FFT spectrum. Used to verify the MIMO array<br>is producing spatially diverse data.|
 
 
 
@@ -288,7 +288,7 @@ For each conrmed track the tracker also produces an azimuth angle estimate. The
 
 |File|Purpose|
 |---|---|
-|calibrate_tx_phase.py|Captures 50 frames with a stationary reference target at boresight<br>(_∼_1.5 m directly in front of the radar) and computes per-RX TX2<br>phase corrections. Saves radar_phase_calibration.npz. Should be<br>re-run at the start of each testing session or after any change to the<br>radar's power state.|
+|calibrate_phase.py|Captures 50 frames with a stationary reference target at boresight<br>(_∼_1.5 m directly in front of the radar) and computes per-RX TX2<br>phase corrections. Saves radar_phase_calibration.npz. Should be<br>re-run at the start of each testing session or after any change to the<br>radar's power state.|
 |radar_phase_calibration.npz|(Generated le.)<br>Contains the four per-RX phase corrections that<br>align TX2's phase with TX0's. Loaded automatically by the monitor<br>and oine replay tools.|
 
 
@@ -301,9 +301,9 @@ mmWave Breathing Monitor
 
 |File|Purpose|
 |---|---|
-|record_ui.py|Minimal recording UI: shows number of tracked people and per-<br>track BPM, with START/STOP buttons and a description text<br>box.<br>Saves each session to recordings/<session_name>/ as<br>three les: tracks CSV, metadata JSON, and signals NPZ (con-<br>taining complex range FFTs).|
+|recording_sessions.py|Minimal recording UI: shows number of tracked people and per-<br>track BPM, with START/STOP buttons and a description text<br>box.<br>Saves each session to recordings/<session_name>/ as<br>three les: tracks CSV, metadata JSON, and signals NPZ (con-<br>taining complex range FFTs).|
 |offline_vital_sign_detection.py|Replays a recorded session through the same pipeline as the live<br>monitor. Interactive UI includes play/pause/seek and speed con-<br>trol. Also supports batch CSV export for A/B comparison of<br>algorithm parameters against the same recording.|
-|plot_recording.py|Post-hoc plotter for recorded sessions. Interactive check-box col-<br>umn lets you select any combination of track and eld to overlay<br>on a time-series plot. Also renders a range-time waterfall from<br>the signals NPZ, and (with raw) an ADC viewer for full-mode<br>recordings.|
+|plot_recoding_session.py|Post-hoc plotter for recorded sessions. Interactive check-box col-<br>umn lets you select any combination of track and eld to overlay<br>on a time-series plot. Also renders a range-time waterfall from<br>the signals NPZ, and (with raw) an ADC viewer for full-mode<br>recordings.|
 
 
 
@@ -334,11 +334,11 @@ mmWave Breathing Monitor
 
 3. In the Lua Shell, browse to and run radar_config_3tx_4rx.lua. Wait for the print output conrming the frame conguration. 
 
-4. Run python calibrate_tx_phase.py with a stationary reference target (e.g., a closed laptop) at boresight, 1.5 m away. The script will report the measured phase corrections and save them. 
+4. Run python calibrate_phase.py with a stationary reference target (e.g., a closed laptop) at boresight, 1.5 m away. The script will report the measured phase corrections and save them. 
 
 5. Conrm the calibration succeeded (std across RX _<_ 30<sup>_◦_</sup> ). If it failed, reposition the target closer to true boresight and rerun. 
 
-6. Ensure the target area is clear of people, then launch python multi_breathing_monitor.py or python record_ui.py depending on whether you're testing or capturing data. 
+6. Ensure the target area is clear of people, then launch python radar_vitals.py or python recording_sessions.py depending on whether you're testing or capturing data. 
 
 7. The application waits for you to press Enter, then does a 10-second background calibration. Keep the area empty during this window. 
 
@@ -350,7 +350,7 @@ mmWave Breathing Monitor
 
 ## 5.3 Recording a session 
 
-1. Launch python record_ui.py. 
+1. Launch python recording_sessions.py. 
 
 2. Type a session description in the text box (e.g., subject_A_normal). Maximum 20 characters; special characters are sanitised. 
 
@@ -364,9 +364,9 @@ mmWave Breathing Monitor
 
 ## 5.4 Post-session analysis 
 
-<mark># View tracks and range -time waterfall for the most recent session: python plot_recording.py</mark> 
+<mark># View tracks and range -time waterfall for the most recent session: python plot_recoding_session.py</mark> 
 
-<mark># View a specific session: python plot_recording.py --session session_20260706_143022_subject_a # Replay a recording through the current pipeline (interactive): python offline_vital_sign_detection .py --session <name > # Batch A/B: dump replayed tracks after tweaking algorithm parameters: python offline_vital_sign_detection .py --dump -csv reprocessed.csv</mark> 
+<mark># View a specific session: python plot_recoding_session.py --session session_20260706_143022_subject_a # Replay a recording through the current pipeline (interactive): python offline_vital_sign_detection.py --session <name> # Batch A/B: dump replayed tracks after tweaking algorithm parameters: python offline_vital_sign_detection.py --dump-csv reprocessed.csv</mark> 
 
 # 6 Recording le format 
 
@@ -428,7 +428,7 @@ Usually caused by inter-TX phase oset. Symptoms:
 
 -  HPBW _>_ 25<sup>_◦_</sup> even for point targets 
 
-Fix: run calibrate_tx_phase.py again with a good stationary target at boresight. 
+Fix: run calibrate_phase.py again with a good stationary target at boresight. 
 
 ## 7.3 RX0 and RX2 report identical values in diagnostic 
 
@@ -438,7 +438,7 @@ Indicates an LVDS-format mismatch between the Lua cong and the Python parser. T
 
 Multiple possible causes: 
 
--  Adaptive background enabled and absorbing the target. Set ADAPTIVE_BG_ENABLED = False in multi_breathing_monitor.py for static environments. 
+-  Adaptive background enabled and absorbing the target. Set ADAPTIVE_BG_ENABLED = False in radar_vitals.py for static environments. 
 
 -  Phase history buer too short. Should be _≥_ 60 seconds for a 40-second BPM window at 50 Hz frame rate. 
 
@@ -471,4 +471,3 @@ This is a multipath artifact: radar _→_ subject _→_ wall _→_ subject _→_
 -  No motion compensation: if the subject moves several centimetres during the 40-second BPM window, the phase unwrap can pick up the motion signal and corrupt the BPM estimate. A rst-order x would be to detrend the phase before the spectral analysis. 
 
 -  Belt integration is optional and not required for radar-only breathing rate measurements; it provides ground truth during validation studies. 
-
