@@ -408,6 +408,7 @@ class Recorder:
                 "bpm",
                 "validated",       # 1 if breathing pattern confirmed, else 0
                 "breathing_score", # 0-1 spectral concentration
+                "peak_concentration",
                 "snr_db",          # spectral SNR of breathing peak
             ])
             for fi, snap in enumerate(self.track_snapshots):
@@ -422,6 +423,7 @@ class Recorder:
                         f"{trk['bpm']:.2f}",
                         1 if trk["validated"] else 0,
                         f"{trk['breathing_score']:.4f}",
+                        f"{trk['peak_concentration']:.4f}",
                         f"{trk['snr_db']:.2f}",
                     ])
 
@@ -810,6 +812,7 @@ def main():
                     "bpm": float(trk.bpm),
                     "validated": bool(trk.breathing_validated),
                     "breathing_score": float(getattr(trk, "breathing_score", 0.0)),
+                    "peak_concentration": float(getattr(trk, "peak_concentration", 0.0)),
                     "snr_db": float(getattr(trk, "peak_snr_db", 0.0)),
                 })
 
