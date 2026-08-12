@@ -13,8 +13,7 @@ A stripped-down version of the main monitor with:
 Recorded files are .npz archives that can be loaded with numpy.
 
 Usage:
-  python record_ui.py
-  python record_ui.py --no-radar --belt-only  # for testing UI without radar
+  python recording_sessions.py
 """
 
 import argparse
@@ -63,6 +62,8 @@ BG_FRAMES         = 500
 BP_LO, BP_HI      = 0.04, 0.6
 BPM_WINDOW_S      = 40
 BPM_REFRESH_S     = 5.0
+BELT_NOMINAL_HZ   = 10
+BELT_PERIOD_MS    = 100
 
 HOST_IP           = "192.168.33.30"
 DATA_PORT         = 4098
@@ -177,6 +178,109 @@ class UDPCapture(threading.Thread):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Belt ground truth (mirrors radar_vitals.py)
+# ═══════════════════════════════════════════════════════════════════════
+def ask_belt():
+    print("\n  Respiration belt ground truth (optional):")
+    try:
+        ans = input("  Connect GDX belt for this recording? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "n"
+    return ans == "y"
+
+
+def select_belt_device():
+    try:
+        from godirect import GoDirect
+    except ImportError:
+        print("ERROR: godirect not installed.  pip install godirect")
+        return None, None
+
+    godirect = GoDirect(use_ble=True, use_usb=False)
+    print("\n[BLE] scanning for Go Direct devices …")
+    devices = godirect.list_devices()
+    gdx = [d for d in devices if d.name and d.name.upper().startswith("GDX")]
+    if not gdx:
+        print("  No GDX devices found. Continuing without belt.")
+        godirect.quit()
+        return None, None
+
+    print(f"\n  Found {len(gdx)} GDX device(s):\n")
+    for i, d in enumerate(gdx):
+        print(f"    [{i}]  {d.name}   (order: {d.order_code})")
+    if len(gdx) == 1:
+        choice = 0
+        print(f"\n  Auto-selecting [{choice}] {gdx[choice].name}")
+    else:
+        while True:
+            try:
+                choice = int(input(f"\n  Select [0-{len(gdx)-1}]: ").strip())
+                if 0 <= choice < len(gdx):
+                    break
+            except (ValueError, EOFError):
+                pass
+    return godirect, gdx[choice]
+
+
+class BeltReader(threading.Thread):
+    def __init__(self, device, data_deque, lock, period_ms=BELT_PERIOD_MS):
+        super().__init__(daemon=True)
+        self.device, self.data, self.lock = device, data_deque, lock
+        self.period_ms = period_ms
+        self.running = True
+        self.t0 = None
+        self.sensor_description = ""
+        self.sensor_units = ""
+
+    def run(self):
+        dev = self.device
+        if not dev.open():
+            print("[BELT] ERROR: could not open device")
+            self.running = False
+            return
+        dev.enable_default_sensors()
+        enabled = dev.get_enabled_sensors()
+        force_sensor = None
+        for s in enabled:
+            if "force" in s.sensor_description.lower():
+                force_sensor = s
+                break
+        if force_sensor is None and enabled:
+            force_sensor = enabled[0]
+        if force_sensor is None:
+            print("[BELT] ERROR: no enabled sensors")
+            self.running = False
+            return
+
+        self.sensor_description = force_sensor.sensor_description
+        self.sensor_units = force_sensor.sensor_units
+        print(f"[BELT] streaming {self.sensor_description} "
+              f"({self.sensor_units}) @ {1000/self.period_ms:.0f} Hz")
+
+        dev.start(period=self.period_ms)
+        self.t0 = time.monotonic()
+        while self.running:
+            try:
+                if dev.read():
+                    v = force_sensor.value
+                    if v is not None and v == v:
+                        with self.lock:
+                            self.data.append((time.monotonic(), float(v)))
+            except Exception as e:
+                if self.running:
+                    print(f"[BELT] error: {e}")
+                break
+        try:
+            dev.stop()
+            dev.close()
+        except Exception:
+            pass
+
+    def stop(self):
+        self.running = False
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Recorder — buffers everything to memory then dumps on stop
 # ═══════════════════════════════════════════════════════════════════════
 class Recorder:
@@ -204,6 +308,8 @@ class Recorder:
         # Shape per frame: (12, n_bins) complex64
         self.range_complex_frames = []
         self.track_snapshots = []    # per-frame list of dicts
+        self.belt_times = []         # seconds relative to shared t_epoch
+        self.belt_force = []         # raw belt Force channel samples
         self.session_name = None
         self.metadata = {}
 
@@ -264,6 +370,15 @@ class Recorder:
         if self.mode == "full":
             self.raw_frames.append(raw_bytes)
 
+    def set_belt_samples(self, samples, t_epoch, stop_wall=None):
+        if self.t_start is None:
+            return
+        stop_wall = time.monotonic() if stop_wall is None else stop_wall
+        filtered = [(wall, val) for wall, val in samples
+                    if self.t_start <= wall <= stop_wall]
+        self.belt_times = [wall - t_epoch for wall, _ in filtered]
+        self.belt_force = [val for _, val in filtered]
+
     def stop(self):
         if not self.recording:
             return None
@@ -322,6 +437,8 @@ class Recorder:
                 "tracks_csv": os.path.basename(csv_path),
             }
         }
+        if "belt" in meta_out:
+            meta_out["belt"]["n_samples_recorded"] = len(self.belt_force)
 
         # ── 3. Signal data → NPZ (always saved) ──────────────────────
         # Range profiles + complex range FFTs are always saved. Raw ADC
@@ -335,6 +452,9 @@ class Recorder:
             # be recomputed from it.
             "range_complex": np.array(self.range_complex_frames, dtype=np.complex64),
         }
+        if self.metadata.get("belt", {}).get("enabled") or self.belt_force:
+            save_dict["belt_times"] = np.array(self.belt_times, dtype=np.float64)
+            save_dict["belt_force"] = np.array(self.belt_force, dtype=np.float32)
         if self.mode == "full":
             raw_all = b"".join(self.raw_frames)
             save_dict["raw_adc"] = np.frombuffer(raw_all, dtype=np.int16).copy()
@@ -369,12 +489,29 @@ def main():
     ap.add_argument("--port", type=int, default=DATA_PORT)
     ap.add_argument("--out-dir", default=RECORDING_DIR)
     ap.add_argument("--notes", default="", help="metadata note stored with the recording")
+    ap.add_argument("--belt-period", type=int, default=BELT_PERIOD_MS,
+                    help="Go Direct belt sampling period in ms")
     args = ap.parse_args()
 
     # Radar startup
     raw_buf = bytearray()
     buf_lock = threading.Lock()
     radar_src = UDPCapture(args.host, args.port, raw_buf, buf_lock)
+
+    # Optional belt ground truth
+    use_belt = False
+    godirect_ctx = None
+    belt_reader = None
+    belt_data = collections.deque()
+    belt_lock = threading.Lock()
+    if ask_belt():
+        godirect_ctx, belt_device = select_belt_device()
+        if godirect_ctx and belt_device:
+            belt_reader = BeltReader(belt_device, belt_data, belt_lock,
+                                     period_ms=args.belt_period)
+            use_belt = True
+        else:
+            print("  Proceeding without belt.")
 
     print("\n" + "═" * 55)
     print("  ENVIRONMENT CALIBRATION")
@@ -383,8 +520,18 @@ def main():
     input("  Press Enter when the area is clear… ")
     print()
 
+    if use_belt:
+        belt_reader.start()
     radar_src.start()
-    t_epoch = time.monotonic()
+
+    if use_belt:
+        print("[MAIN] waiting for belt …")
+        deadline = time.monotonic() + 15
+        while belt_reader.t0 is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if belt_reader.t0 is None:
+            print("WARNING: belt did not produce data within 15 s")
+    t_epoch = belt_reader.t0 if use_belt and belt_reader.t0 else time.monotonic()
 
     # Radar state
     rng = range_axis(NUM_ADC_SAMPLES)
@@ -535,6 +682,13 @@ def main():
                 "fps": FPS_HZ,
                 "calibration_loaded": tx2_phase_correction is not None,
             },
+            "belt": {
+                "enabled": use_belt,
+                "period_ms": args.belt_period if use_belt else None,
+                "nominal_hz": BELT_NOMINAL_HZ if use_belt else None,
+                "sensor": belt_reader.sensor_description if use_belt else "",
+                "units": belt_reader.sensor_units if use_belt else "",
+            },
         }
         recorder.start(mode, metadata, description=description)
         btn_start.ax.set_facecolor("#333")
@@ -546,6 +700,11 @@ def main():
     def on_stop(_):
         if not recorder.recording:
             return
+        if use_belt:
+            stop_wall = time.monotonic()
+            with belt_lock:
+                belt_snapshot = list(belt_data)
+            recorder.set_belt_samples(belt_snapshot, t_epoch, stop_wall=stop_wall)
         base = recorder.stop()
         btn_start.ax.set_facecolor("#00b050")
         btn_start.label.set_color("white")
@@ -733,10 +892,20 @@ def main():
 
     if recorder.recording:
         print("\n[MAIN] recording still active — stopping and saving…")
+        if use_belt:
+            stop_wall = time.monotonic()
+            with belt_lock:
+                belt_snapshot = list(belt_data)
+            recorder.set_belt_samples(belt_snapshot, t_epoch, stop_wall=stop_wall)
         recorder.stop()
 
+    if belt_reader:
+        belt_reader.stop()
+        belt_reader.join(timeout=3)
     radar_src.stop()
     radar_src.join(timeout=2)
+    if godirect_ctx:
+        godirect_ctx.quit()
     print("[DONE]")
 
 
